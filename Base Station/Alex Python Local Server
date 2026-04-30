@@ -1,0 +1,270 @@
+import serial
+import time
+import folium
+import tkinter as tk
+from tkinter import Label, Entry, Button
+import csv
+from datetime import datetime
+from flask import Flask, render_template_string, send_from_directory
+import os
+import threading
+
+app = Flask(__name__)
+map_filename = "static/map.html"
+log_filename = "data_log.csv"
+home_location = [53.9462, -1.02605]  # Default home location
+waypoints = [
+    (53.9461, -1.0276),  # Waypoint 1
+    (53.94619, -1.02664),  # Waypoint 2
+    (53.94647, -1.02664),  # Waypoint 3
+    (53.94643, -1.02775),  # Waypoint 4
+    (53.9465, -1.0262),  # Waypoint 5
+]
+zoom_level = 17  # Default zoom level
+
+# Ensure static directory exists
+if not os.path.exists("static"):
+    os.makedirs("static")
+
+# SERIAL PORT SETUP, PORT MAY NEED EDITS DEPENDING
+try:
+    ser = serial.Serial('COM16', 9600, timeout=1)
+    time.sleep(2)
+except serial.SerialException:
+    print("Error: Could not open serial port. Check connection.")
+    exit()
+
+# Create GUI
+root = tk.Tk()  
+root.title("ESP32 Data Display")
+root.geometry("500x650")
+
+labels = {}
+data_keys = [ "Status", "Latitude", "Longitude", "Altitude", "SIV", "Speed", "Heading", "Temperature", "pH", "Turbidity", "Index"]
+for i, key in enumerate(data_keys):
+    tk.Label(root, text=f"{key}: ", font=("Arial", 11)).grid(row=i, column=0, sticky="w")
+    labels[key] = Label(root, text="Waiting...", font=("Arial", 11))
+    labels[key].grid(row=i, column=1, sticky="w")
+
+# Waypoint entry setup
+tk.Label(root, text="Waypoints (lat, lon):", font=("Arial", 12, "bold")).grid(row=11, column=0, columnspan=2, pady=(10, 0))
+waypoint_entries = []
+waypoint_vars = []  # Store values for waypoint persistence
+for i in range(5):
+    lat_var = tk.StringVar(value=str(waypoints[i][0]))
+    lon_var = tk.StringVar(value=str(waypoints[i][1]))
+    tk.Label(root, text=f"W{i+1} Latitude:").grid(row=12 + i, column=0, sticky="e")
+    tk.Label(root, text=f"Longitude:").grid(row=12 + i, column=2, sticky="e")
+    lat_entry = Entry(root, textvariable=lat_var, width=10)
+    lon_entry = Entry(root, textvariable=lon_var, width=10)
+    lat_entry.grid(row=12 + i, column=1)
+    lon_entry.grid(row=12 + i, column=3)
+    waypoint_entries.append((lat_entry, lon_entry))
+    waypoint_vars.append((lat_var, lon_var))  # Store as StringVar objects
+
+# Home location entry
+tk.Label(root, text="Home Location (center map):", font=("Arial", 12, "bold")).grid(row=18, column=0, columnspan=2, pady=(10, 0))
+home_lat_var = tk.StringVar(value=str(home_location[0]))
+home_lon_var = tk.StringVar(value=str(home_location[1]))
+tk.Label(root, text="Latitude:").grid(row=19, column=0, sticky="e")
+tk.Label(root, text="Longitude:").grid(row=19, column=2, sticky="e")
+home_lat_entry = Entry(root, textvariable=home_lat_var, width=10)
+home_lon_entry = Entry(root, textvariable=home_lon_var, width=10)
+home_lat_entry.grid(row=19, column=1)
+home_lon_entry.grid(row=19, column=3)
+
+# Slider for Zoom Level
+tk.Label(root, text="Zoom Level:", font=("Arial", 12, "bold")).grid(row=20, column=0, columnspan=2, pady=(10, 0))
+zoom_slider = tk.Scale(root, from_=1, to=20, orient="horizontal", length=200)
+zoom_slider.set(zoom_level)  # Default zoom level
+zoom_slider.grid(row=21, column=0, columnspan=4)
+
+# Store last known GPS position
+last_known_position = [home_location[0], home_location[1]]
+
+# Apply Changes Button
+def apply_changes():
+    global home_location, waypoints, zoom_level
+
+    print("Manually applying changes to map...")
+
+    try:
+        # Update home location
+        home_lat = float(home_lat_var.get())
+        home_lon = float(home_lon_var.get())
+        home_location[0], home_location[1] = home_lat, home_lon
+    except ValueError:
+        pass  # fallback to previous
+
+    # Update waypoints based on entries
+    waypoints = []
+    for i, (lat_var, lon_var) in enumerate(waypoint_vars):
+        try:
+            lat = float(lat_var.get())
+            lon = float(lon_var.get())
+            # Update waypoints with new data
+            waypoints.append((lat, lon))
+        except ValueError:
+            pass  # Ignore invalid entries
+
+    # Update zoom level from the slider
+    zoom_level = zoom_slider.get()
+
+    # Create new map with updated waypoints and zoom level
+    create_map(last_known_position[0], last_known_position[1])
+
+        # Send updated waypoints to ESP32
+    if ser.is_open:
+        try:
+            waypoint_str = "W:"
+            for lat, lon in waypoints:
+                waypoint_str += f"{lat:.6f}:{lon:.6f}:"
+            waypoint_str = waypoint_str.rstrip(";") + "\n"
+            ser.write(waypoint_str.encode())
+            print(f"📤 Sent to ESP32: {waypoint_str.strip()}")
+        except Exception as e:
+            print(f"Failed to send waypoints: {e}")
+
+
+Button(root, text="Apply Changes", command=apply_changes, bg="lightblue").grid(row=22, column=0, columnspan=4, pady=10)
+
+# Create map function
+def create_map(current_lat, current_lon):
+    global home_location, waypoints, zoom_level
+
+    try:
+        home_lat = float(home_lat_var.get())
+        home_lon = float(home_lon_var.get())
+        home_location = [home_lat, home_lon]
+    except ValueError:
+        pass  # fallback to default or previous
+
+    # Create a new map centered at home_location with zoom level
+    m = folium.Map(location=home_location, zoom_start=zoom_level)
+
+    # Add live boat marker
+    folium.Marker(
+        [current_lat, current_lon],
+        popup=f"Boat @ {current_lat:.6f}, {current_lon:.6f}",
+        icon=folium.Icon(color='red')
+    ).add_to(m)
+
+    # Add waypoint circles from waypoints
+    for i, (lat, lon) in enumerate(waypoints):
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=6,  # in pixels
+            color='pink',
+            fill=True,
+            fill_color='pink',
+            fill_opacity=0.6,
+            popup=f"Waypoint {i+1} @ {lat:.6f}, {lon:.6f}"
+        ).add_to(m)
+
+    # Save the map as HTML
+    m.save(map_filename)
+
+# LOG FILE SETUP, DUMPS TO PC STORAGE IN USER FILE
+with open(log_filename, "a", newline="") as file:
+    writer = csv.writer(file)
+    if file.tell() == 0:
+        writer.writerow(["Timestamp", "Latitude", "Longitude", "Altitude", "SIV", "Speed", "Turbidity", "Status", "Heading", "Temperature", "pH", "Index"])
+
+# Main display updater
+def update_display():
+    ser.flush()
+    if ser.in_waiting > 0:
+
+        raw_data = ser.readline().decode('utf-8', errors='ignore').strip()
+        print(f"RAW; {raw_data}")
+
+        if raw_data.startswith("Received from LoRa ="):
+            raw_data = raw_data.replace("Received from LoRa =", "").strip()
+
+
+        if raw_data.startswith("T"):
+            raw_data = raw_data[1:]  # Remove the leading 'T'
+
+        data_values = raw_data.split(":")
+
+        if len(data_values) != 11:
+            print("Incomplete data")
+            root.after(300, update_display)
+            return
+
+        print("Data Values:", data_values)
+
+        try:
+            latitude = float(data_values[0])
+            longitude = float(data_values[1])
+            altitude = float(data_values[2])
+            siv = float(data_values[3])
+            speed = float(data_values[4])
+            turbidity = float(data_values[5])
+            status = data_values[6]  # This is a string like "MANUAL"
+            heading = float(data_values[7])
+            temperature = float(data_values[8])
+            pH = float(data_values[9])
+            index = int(data_values[10])
+        except ValueError:
+            print("Invalid data types")
+            root.after(300, update_display)
+            return
+
+
+        labels["Latitude"].config(text=f"{latitude:.6f}°")
+        labels["Longitude"].config(text=f"{longitude:.6f}°")
+        labels["Altitude"].config(text=f"{altitude:.2f} m")
+        labels["SIV"].config(text=int(siv))
+        labels["Speed"].config(text=f"{speed:.2f} m/s")
+        labels["Turbidity"].config(text=f"{turbidity:.2f} NTU")
+        labels["Status"].config(text=status)
+        labels["Heading"].config(text=f"{heading:.2f}°")
+        labels["Temperature"].config(text=f"{temperature:.2f}°C")
+        labels["pH"].config(text=f"{pH:.2f}")
+        labels["Index"].config(text=int(index))
+
+
+        # Update map
+        last_known_position[0] = latitude
+        last_known_position[1] = longitude
+        create_map(latitude, longitude)
+
+        # Log to CSV
+        with open(log_filename, "a", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                             latitude, longitude, altitude, siv,
+                             speed, turbidity, status, heading,
+                             temperature, pH, index])
+
+        print("Map updated")
+
+    root.after(300, update_display)
+
+# Flask routes
+@app.route('/')
+def serve_map():
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>ESP32 GPS Map</title>
+        <meta http-equiv="refresh" content="5">
+    </head>
+    <body>
+        <h1>ESP32 GPS Map</h1>
+        <iframe src="/map" width="100%" height="600px"></iframe>
+    </body>
+    </html>
+    """)
+
+@app.route('/map')
+def get_map():
+    return send_from_directory("static", "map.html")
+
+# Start Flask and GUI
+if __name__ == '__main__':
+    threading.Thread(target=lambda: app.run(debug=True, use_reloader=False)).start()
+    update_display()
+    root.mainloop()

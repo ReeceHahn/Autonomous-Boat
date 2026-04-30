@@ -1,0 +1,108 @@
+# Stack overflow for lines https://stackoverflow.com/questions/75172069/folium-initial-map-coordinates-location-not-working
+
+import serial
+import time
+import folium
+import tkinter as tk
+from tkinter import Label
+import csv
+from datetime import datetime
+
+# SERIAL PORT SETUP
+try:
+    ser = serial.Serial('COM16', 9600, timeout=1)  # Adjust to your port (Usually 16, 19 or 21, use Arduino IDE to find it, will not work if port is in use with Arduino)
+    time.sleep(2)  # Allow serial to initialize
+except serial.SerialException:
+    print("Error: Could not open serial port. Check connection.")
+    exit()
+
+# MAP SETUP
+map_filename = "map.html"
+m = folium.Map(location=[0.0, 0.0], zoom_start=5)
+folium.Marker([0.0, 0.0], popup="Waiting for GPS...").add_to(m)
+m.save(map_filename)
+
+# LOG FILE SETUP
+log_filename = "data_log.csv"
+with open(log_filename, "a", newline="") as file:
+    writer = csv.writer(file)
+    if file.tell() == 0:
+        writer.writerow(["Timestamp", "Latitude", "Longitude", "Altitude", "SIV", "Roll", "Pitch", "Yaw", "Heading"])
+
+# GUI WINDOW
+root = tk.Tk()
+root.title("ESP32 Data Display")
+root.geometry("400x300")
+
+# LABELS FOR DISPLAYING DATA
+labels = {}
+data_keys = ["Latitude", "Longitude", "Altitude", "SIV", "Roll", "Pitch", "Yaw", "Heading"]
+for i, key in enumerate(data_keys):
+    tk.Label(root, text=f"{key}: ", font=("Arial", 12)).grid(row=i, column=0, sticky="w")
+    labels[key] = Label(root, text="Waiting...", font=("Arial", 12))
+    labels[key].grid(row=i, column=1, sticky="w")
+
+def is_valid_data(data_values):
+    """Check if all 8 values are valid numbers."""
+    if len(data_values) != 8:
+        return False
+    try:
+        list(map(float, data_values))  # Try converting all values to float
+        return True
+    except ValueError:
+        return False
+
+def update_display():
+    if ser.in_waiting > 0:
+        raw_data = ser.readline().decode('utf-8', errors='ignore').strip()
+        
+        # Print the raw serial data
+        print(f"RAW SERIAL INPUT: {raw_data}")
+
+        data_values = raw_data.split(",")
+
+        # Ignore invalid data
+        if not is_valid_data(data_values):
+            print("❌ Error: Invalid data format. Skipping...")
+            root.after(1000, update_display)
+            return 
+
+        # Parse valid data
+        latitude, longitude, altitude, siv, roll, pitch, yaw, heading = map(float, data_values)
+
+        # Update labels
+        labels["Latitude"].config(text=f"{latitude:.6f}")
+        labels["Longitude"].config(text=f"{longitude:.6f}")
+        labels["Altitude"].config(text=f"{altitude:.2f} m")
+        labels["SIV"].config(text=int(siv))
+        labels["Roll"].config(text=f"{roll:.2f}°")
+        labels["Pitch"].config(text=f"{pitch:.2f}°")
+        labels["Yaw"].config(text=f"{yaw:.2f}°")
+        labels["Heading"].config(text=f"{heading:.2f}°")
+
+        # UPDATE MAP (Zoom set to 5)
+        m = folium.Map(location=[latitude, longitude], zoom_start=18)
+        folium.Marker([latitude, longitude], popup=f"Boat @ {latitude}, {longitude}").add_to(m)
+
+        #Test case inside emf
+        #m = folium.Map(location=[53.948263, -1.043883], zoom_start=19)
+        #folium.Marker([53.948263, -1.043883], popup=f"TestMark @ {53.948263}, {-1.043883}").add_to(m) #53.948263, -1.043883 EMF
+
+        m.save(map_filename)
+
+        # Inject JavaScript to refresh the map **without opening a new page**
+        with open(map_filename, "a") as f:
+            f.write('<script>setTimeout(() => { location.reload(); }, 3000);</script>')  # Refresh every 3s
+
+        # LOG DATA
+        with open(log_filename, "a", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), latitude, longitude, altitude, siv, roll, pitch, yaw, heading])
+
+        print("✅ Map updated, refreshing.")
+
+    root.after(1000, update_display)  # Run every second
+
+# START GUI LOOP
+update_display()
+root.mainloop()
